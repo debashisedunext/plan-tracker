@@ -1,0 +1,16 @@
+{
+  "_comment": [
+    "Manual status overrides. Status is normally DERIVED from git — merged to",
+    "the integration branch = done, open PR = in review, pushed branch = in",
+    "progress. Use this file only when reality and git genuinely disagree:",
+    "work that predates the task-ID commit convention, or something half-done",
+    "with nothing pushed.",
+    "",
+    "Every override needs a reason. An override without one is how a plan",
+    "starts reporting what people wish were true.",
+    "",
+    "  \"A-013\": { \"status\": \"in-progress\", \"pct\": 40, \"reason\": \"...\" }",
+    "",
+    "Valid status values: todo | in-progress | in-review | done | blocked"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "plan-tracker",
+  "version": "1.0.0",
+  "description": "Project scheduling from a markdown backlog. Derives task status from git, schedules under resource constraints, and publishes a Gantt chart plus per-developer daily briefs.",
+  "author": { "name": "EduNext Technologies" },
+  "keywords": ["planning", "gantt", "scheduling", "project-management", "standup"]
+}

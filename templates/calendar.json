@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "The working calendar every date in the plan is computed against.",
+    "Weekends are always non-working. Add org holidays to `holidays` as",
+    "YYYY-MM-DD, and per-developer time off under `leave` keyed by the same",
+    "owner name used in plan.config.json. Anything here shifts the forecast on",
+    "the next run.",
+    "",
+    "Fill in the holidays before anyone reads a date off this plan. Without",
+    "them every forecast is optimistic by exactly the number of holidays in",
+    "the project, and nobody notices until the end."
+  ],
+
+  "project_start": "__START__",
+  "working_weekdays": [0, 1, 2, 3, 4],
+  "hours_per_day": 8,
+
+  "holidays": [],
+
+  "leave": {}
+}

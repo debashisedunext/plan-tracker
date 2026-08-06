@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Everything project-specific lives here. The engine knows nothing else.",
+    "",
+    "streams  — one per person who owns a slice of the work. The key becomes",
+    "           the first character of that stream's task IDs (A-001, B-014),",
+    "           and its colour on the chart. Eight maximum: past that no two",
+    "           colours are reliably distinguishable.",
+    "task_id  — the regex your task IDs match. Whatever you choose, it must be",
+    "           greppable in a commit subject, because that is how status is",
+    "           derived. Keep it short and unambiguous.",
+    "backlogs — globs for the markdown files holding the tasks. Give each",
+    "           stream its own `backlog` instead if you prefer one file each.",
+    "branch   — the integration branch. Merged there means done.",
+    "repo     — owner/name on GitHub. Leave empty to skip PR status and briefs."
+  ],
+
+  "project": "__PROJECT__",
+  "repo": "",
+  "start": "__START__",
+  "branch": "develop",
+  "plan_dir": "__PLANDIR__",
+  "backlogs": ["docs/streams/*.md"],
+  "task_id": "[A-Z]-\\d{3}",
+  "title_max": 68,
+
+  "streams": {
+    "A": {
+      "title": "Rename me",
+      "owner": "First Developer",
+      "github": ""
+    },
+    "B": {
+      "title": "Rename me too",
+      "owner": "Second Developer",
+      "github": ""
+    }
+  }
+}

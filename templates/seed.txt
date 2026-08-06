@@ -1,0 +1,18 @@
+# Estimates and dependencies, read ONCE per task — the first time it appears.
+# After that `tasks.csv` is the source of truth and this file is ignored for it.
+#
+#   ID | estimate_days | predecessor,predecessor | c or i
+#
+# estimate_days  working days of one developer, half-day granularity.
+#                Include writing the tests, not just the code.
+# predecessors   task IDs that must finish first. Cross-stream edges are the
+#                ones that matter — those are what stall people.
+# c / i          confirmed (the owner agreed) or inferred (someone guessed).
+#                A critical path through inferred edges is a hypothesis, so
+#                get them confirmed before anyone quotes a date from it.
+#
+# Example:
+#
+# A-001 | 1.0 |             | c
+# A-002 | 1.5 | A-001       | c
+# B-001 | 2.0 | A-002       | i
