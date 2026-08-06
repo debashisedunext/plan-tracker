@@ -24,15 +24,29 @@ el("status").value = "done"; ctx.draw(); console.log("filter status=done → row
 el("status").value = ""; el("crit").checked = true; ctx.draw(); console.log("filter critical → rows", count('class="row"'));
 el("crit").checked = false; el("q").value = "ribbon"; ctx.draw(); console.log("search 'ribbon' → rows", count('class="row"'));
 el("q").value = "zzzz"; ctx.draw(); console.log("search 'zzzz' → empty state:", g().includes("No tasks match"));
-el("q").value = ""; ctx.devs.delete("A"); ctx.devs.delete("B"); ctx.draw();
-console.log("only C+D → lanes", count('class="lane-h"'), "rows", count('class="row"'));
+el("q").value = "";
+const keys = [...ctx.devs];
+if (keys.length > 1) {
+  ctx.devs.delete(keys[0]);
+  ctx.draw();
+  console.log(`drop stream ${keys[0]} → lanes ${count('class="lane-h"')} rows ${count('class="row"')}`);
+  ctx.devs.add(keys[0]);
+}
 
 // label column width control
 for (const w of [240, 360, 560]) {
   ctx.setLW(w); ctx.draw();
   const laneW = /class="lane-h" style="width:(\d+)px"/.exec(g());
-  console.log(`LW=${w}  --lw=${store.__vars["--lw"]}  lane width=${laneW && laneW[1]}px`);
+  if (!laneW) { console.log(`LW=${w}  FAIL — no lane rendered`); process.exitCode = 1; continue; }
+  console.log(`LW=${w}  --lw=${store.__vars["--lw"]}  lane width=${laneW[1]}px`);
 }
 // no title may overflow its column: every label carries a title attribute and ellipsis CSS
 const longest = Math.max(...ctx.TASKS.map(t => t.t.length));
 console.log("longest task title:", longest, longest <= 68 ? "OK" : "TOO LONG");
+
+const bars = count('class="b ');
+if (bars !== ctx.TASKS.length) {
+  console.log(`FAIL — ${bars} bars for ${ctx.TASKS.length} tasks`); process.exitCode = 1;
+} else if (!process.exitCode) {
+  console.log(`\nOK — ${bars} bars across ${count('class="lane-h"')} lanes`);
+}

@@ -15,7 +15,15 @@
 # walking up from the current directory.
 set -euo pipefail
 
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve through symlinks — this is normally installed as a link on PATH, and
+# `dirname $BASH_SOURCE` would then point at the link's directory, not the repo.
+SRC="${BASH_SOURCE[0]}"
+while [[ -L "$SRC" ]]; do
+  DIR="$(cd -P "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  [[ "$SRC" != /* ]] && SRC="$DIR/$SRC"
+done
+HERE="$(cd -P "$(dirname "$SRC")" && pwd)"
 ENGINE="$HERE/engine"
 PY="${PLAN_PYTHON:-python3}"
 
