@@ -246,9 +246,14 @@ def git_evidence():
             record(tid, "in-progress", "branch " + br, first_day)
 
     for pr in open_pull_requests():
-        blob = " ".join(str(pr.get(k, "")) for k in ("title", "body")) + " " + \
-               str(pr.get("head", {}).get("ref", ""))
-        for tid in set(TASK_ID.findall(blob)):
+        # Title and branch name only, plus an explicit trailer — never loose prose
+        # in the body. A PR that says "this unblocks D-004" would otherwise mark
+        # D-004 as in review, which is the opposite of what it says.
+        ids = set(TASK_ID.findall(pr.get("title") or "")) \
+            | set(TASK_ID.findall(str(pr.get("head", {}).get("ref", ""))))
+        for m in TRAILER.finditer(pr.get("body") or ""):
+            ids |= set(TASK_ID.findall(m.group(1)))
+        for tid in ids:
             record(tid, "in-review", "PR #%s open" % pr["number"])
 
     return ev
