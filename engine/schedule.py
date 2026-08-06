@@ -156,6 +156,38 @@ def sh(cmd):
         return ""
 
 
+def open_pull_requests():
+    """
+    Open PRs, via the REST API rather than the `gh` CLI.
+
+    Shelling out to `gh` meant PR status silently did nothing on any machine
+    without it installed — which is most machines, and a scheduled job never
+    reports the omission. urllib is always there.
+    """
+    if not CFG.repo:
+        return []
+    tok = os.environ.get("GITHUB_TOKEN")
+    if not tok:
+        for p in ("~/.config/plan-tracker/gh-token", "~/.config/edutrack/gh-token"):
+            path = os.path.expanduser(p)
+            if os.path.exists(path):
+                tok = open(path).read().strip()
+                break
+    if not tok:
+        return []
+    import urllib.request
+    req = urllib.request.Request(
+        "https://api.github.com/repos/%s/pulls?state=open&per_page=100" % CFG.repo,
+        headers={"Authorization": "Bearer " + tok,
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "plan-tracker"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read())
+    except Exception:
+        return []   # offline, or the token lapsed — status degrades, nothing breaks
+
+
 def git_evidence():
     """
     Map every task ID to what git can prove about it.
@@ -213,15 +245,11 @@ def git_evidence():
         for tid in ids:
             record(tid, "in-progress", "branch " + br, first_day)
 
-    pr_json = "" if not CFG.repo else sh(["gh", "pr", "list", "--state", "open", "--limit", "100",
-                  "--json", "number,title,headRefName,body"])
-    try:
-        for pr in json.loads(pr_json or "[]"):
-            blob = " ".join(str(pr.get(k, "")) for k in ("title", "headRefName", "body"))
-            for tid in set(TASK_ID.findall(blob)):
-                record(tid, "in-review", "PR #%s open" % pr["number"])
-    except Exception:
-        pass
+    for pr in open_pull_requests():
+        blob = " ".join(str(pr.get(k, "")) for k in ("title", "body")) + " " + \
+               str(pr.get("head", {}).get("ref", ""))
+        for tid in set(TASK_ID.findall(blob)):
+            record(tid, "in-review", "PR #%s open" % pr["number"])
 
     return ev
 
