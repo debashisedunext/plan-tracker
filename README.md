@@ -13,6 +13,9 @@ plan init            scaffold plan.config.json and the plan directory
 plan refresh         re-derive status from git, reschedule, rebuild outputs
 plan brief           post today's briefs to GitHub issues
 plan daily           refresh + commit + push + brief   (what the 09:00 job runs)
+plan publish         push gantt.html to the configured claude.ai Artifact
+plan watch           poll the remote; on any push, refresh + publish
+plan watch install   run that poll every 60s in the background
 plan cron install    run `plan daily` at 09:00, Monday to Friday
 plan check           prove the chart actually renders
 plan config          show what this project is configured as
@@ -37,6 +40,53 @@ ln -s ~/Documents/Projects/plan-tracker ~/.claude/plugins/plan-tracker
 
 Requires Python 3.8+, git, and node (only for `plan check`).
 `plan cron install` is macOS; on Linux use the crontab line it prints.
+Publishing additionally needs the [Claude Code CLI](https://claude.ai/install.sh)
+— set `PLAN_CLAUDE` if it is somewhere unusual.
+
+---
+
+## Sharing the chart as a link
+
+`gantt.html` is self-contained, so it can be published as a claude.ai Artifact
+and shared with people who will never clone the repo.
+
+**A published artifact cannot pull.** Its CSP blocks every external host and the
+runtime grants no network capability, so the page can never fetch the repo —
+least of all a private one, where a token embedded in a shareable page would be
+a credential leak. The only direction that works is push.
+
+Publish it once by hand to get a URL, then put it in `plan.config.json`:
+
+```json
+"artifact": {
+  "url": "https://claude.ai/code/artifact/<uuid>",
+  "favicon": "📊",
+  "model": "haiku"
+}
+```
+
+```bash
+plan publish            # push the current chart to that URL
+plan watch install      # …and do it within 60s of anyone pushing
+```
+
+Three things make this cheap enough to run continuously:
+
+- **It skips when nothing changed.** The published bytes are hashed; an
+  identical chart costs nothing and takes 80ms.
+- **It runs on Haiku.** Publishing is one tool call and no reasoning. On Opus
+  the same job costs 33× more and takes 8× longer, for an identical result.
+- **It records the remote's refs *after* its own push**, so the commit it just
+  made is already accounted for and cannot trigger the next round. Without
+  that, a push-triggered refresh that commits is an infinite loop.
+
+`force: true` is used deliberately: `gantt.html` is regenerated wholesale on
+every run, so there is never anything in the live version worth merging — and
+without it every run would 409, since a fresh session holds no baseline.
+
+**Known gap:** the watcher polls git refs, so it sees pushes, not PR
+open/close. Those usually follow a push within minutes; the 09:00 job catches
+whatever slipped through.
 
 ---
 

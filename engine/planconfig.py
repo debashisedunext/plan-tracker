@@ -57,6 +57,22 @@ class Config(object):
         self.title_max = int(data.get("title_max", 68))
         self.hours_per_day = float(data.get("hours_per_day", 8))
 
+        # Optional: republish gantt.html to a claude.ai Artifact after a refresh.
+        # A published artifact cannot fetch anything — its CSP blocks every
+        # external host and there is no network capability — so it can only ever
+        # be pushed to. See `plan publish`.
+        art = data.get("artifact") or {}
+        self.artifact_url = art.get("url", "")
+        self.artifact_favicon = art.get("favicon", "\U0001F4CA")
+        self.artifact_model = art.get("model", "haiku")
+        self.artifact_description = art.get(
+            "description", "%s master schedule, regenerated from git." % self.project)
+        if self.artifact_url and "/artifact/" not in self.artifact_url:
+            raise ConfigError(
+                "artifact.url must be a claude.ai artifact URL of the form\n"
+                "  https://claude.ai/code/artifact/<uuid>\n"
+                "got: %r" % self.artifact_url)
+
         self.streams = {}
         for i, (key, s) in enumerate(sorted(data["streams"].items())):
             if not re.match(r"^[A-Za-z0-9]{1,4}$", key):
@@ -132,7 +148,29 @@ def load(start=None):
     return Config(path, {k: v for k, v in data.items() if not k.startswith("_")})
 
 
+def _sh(value):
+    """Single-quote a value so bash's `eval` cannot reinterpret it."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
 if __name__ == "__main__":
+    # `--shell` emits assignments for `eval` in the CLI, so bash never has to
+    # parse JSON itself. Every value is quoted; nothing here is interpolated raw.
+    if "--shell" in sys.argv[1:]:
+        cfg = load()
+        for name, value in (
+                ("PLAN_ROOT", cfg.root),
+                ("PLAN_PROJECT", cfg.project),
+                ("PLAN_DIR", os.path.relpath(cfg.plan_dir, cfg.root)),
+                ("PLAN_BRANCH", cfg.branch),
+                ("PLAN_REPO", cfg.repo),
+                ("PLAN_ARTIFACT_URL", cfg.artifact_url),
+                ("PLAN_ARTIFACT_FAVICON", cfg.artifact_favicon),
+                ("PLAN_ARTIFACT_MODEL", cfg.artifact_model),
+                ("PLAN_ARTIFACT_DESC", cfg.artifact_description)):
+            print("%s=%s" % (name, _sh(value)))
+        sys.exit(0)
+
     cfg = load()
     print("config   %s" % cfg.config_path)
     print("project  %s" % cfg.project)
@@ -141,6 +179,7 @@ if __name__ == "__main__":
     print("plan dir %s" % os.path.relpath(cfg.plan_dir, cfg.root))
     print("backlogs %s" % ", ".join(cfg.backlogs))
     print("task ids %s" % cfg.task_id_pattern)
+    print("artifact %s" % (cfg.artifact_url or "(not published)"))
     for k, s in cfg.streams.items():
         print("  %-3s %-22s %-12s %s %s"
               % (k, s["title"], s["owner"], s["color"],

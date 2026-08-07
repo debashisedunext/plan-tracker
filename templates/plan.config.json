@@ -12,7 +12,18 @@
     "backlogs — globs for the markdown files holding the tasks. Give each",
     "           stream its own `backlog` instead if you prefer one file each.",
     "branch   — the integration branch. Merged there means done.",
-    "repo     — owner/name on GitHub. Leave empty to skip PR status and briefs."
+    "repo     — owner/name on GitHub. Leave empty to skip PR status and briefs.",
+    "artifact — optional, and omitted below. Republishes gantt.html to a",
+    "           claude.ai Artifact so the chart is shareable as a link:",
+    "",
+    "             \"artifact\": {",
+    "               \"url\": \"https://claude.ai/code/artifact/<uuid>\",",
+    "               \"favicon\": \"📊\", \"model\": \"haiku\"",
+    "             }",
+    "",
+    "           Publish it once by hand to get the URL, paste it here, and",
+    "           `plan publish` keeps it current. Leave the block out and",
+    "           nothing is ever published."
   ],
 
   "project": "__PROJECT__",

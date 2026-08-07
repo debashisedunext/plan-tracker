@@ -5,6 +5,9 @@
 #   plan refresh         re-derive status from git, reschedule, rebuild outputs
 #   plan brief           post today's briefs to GitHub issues
 #   plan daily           refresh + commit + push + brief   (what the 09:00 job runs)
+#   plan publish         push gantt.html to the configured claude.ai Artifact
+#   plan watch           poll the remote; on any push, refresh + publish
+#   plan watch install   run that poll every 60s in the background
 #   plan cron install    run `plan daily` at 09:00, Monday to Friday
 #   plan cron status     is it scheduled, when did it last run
 #   plan cron remove     stop it
@@ -42,6 +45,104 @@ find_root() {
 
 label_for() {  # a launchd label unique to this project path
   echo "com.plantracker.$(find_root | shasum | cut -c1-10)"
+}
+
+# Config as shell variables. Python owns the JSON; bash never parses it.
+load_config() { eval "$("$PY" "$ENGINE/planconfig.py" --shell)"; }
+
+# State the watcher keeps between runs — deliberately OUT of the repo, so a
+# scheduled job can never dirty the working tree it is watching.
+state_dir() {
+  local d="${XDG_CACHE_HOME:-$HOME/.cache}/plan-tracker"
+  mkdir -p "$d"; echo "$d"
+}
+
+# Can a launchd agent actually reach this project?
+#
+# On macOS, ~/Documents, ~/Desktop and ~/Downloads are TCC-protected. A
+# LaunchAgent running /bin/bash there fails with "Operation not permitted" and
+# exit 126 — while `launchctl print` still cheerfully reports the job as
+# scheduled. That combination is the worst possible: the tracker says it is
+# automated, the log fills with permission errors nobody reads, and the plan
+# quietly stops updating. So prove it with a throwaway job before claiming it.
+preflight_launchd() {
+  local root="$1"
+  [[ "$(uname)" == "Darwin" ]] || return 0
+  local label="com.plantracker.preflight.$$"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
+  local probe; probe="$(state_dir)/preflight.$$"
+
+  { echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+    echo '<plist version="1.0"><dict>'
+    echo "  <key>Label</key><string>$label</string>"
+    echo '  <key>ProgramArguments</key>'
+    # Must actually cd and READ. `test -r` only calls access(2), which TCC
+    # permits — the denial lands on open(2). A probe that asks the wrong
+    # syscall passes cheerfully while the real job dies, which is the precise
+    # false-pass this whole function exists to prevent.
+    # `&&` must reach the plist as the XML entity &amp;&amp;. Escaping it as
+    # \&\& in bash leaks the backslashes into the XML, and the job then reads
+    # `cd … \& & echo ok > probe` — an unconditional background write. The probe
+    # passes every time, including on a machine where the job cannot run at all.
+    echo "  <array><string>/bin/bash</string><string>-c</string><string>cd '$root' &amp;&amp; head -c 1 plan.config.json >/dev/null &amp;&amp; echo ok > '$probe'</string></array>"
+    echo "  <key>WorkingDirectory</key><string>$root</string>"
+    echo '  <key>RunAtLoad</key><false/>'
+    echo '</dict></plist>'
+  } > "$plist"
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null || true
+  launchctl kickstart -k "gui/$(id -u)/$label" 2>/dev/null || true
+  local i; for i in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -f "$probe" ]] && break
+    "$PY" -c "import time; time.sleep(0.4)"
+  done
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  rm -f "$plist"
+  if [[ -f "$probe" ]]; then rm -f "$probe"; return 0; fi
+  return 1
+}
+
+tcc_advice() {
+  local root="$1"
+  cat >&2 <<EOF
+
+  ✗ A background job cannot read $root.
+
+    macOS protects ~/Documents, ~/Desktop and ~/Downloads. The job will be
+    scheduled and will run, but every run dies with "Operation not permitted"
+    — and \`launchctl\` still reports it as healthy, so nothing tells you.
+
+    Two fixes, either one is enough:
+
+    1. System Settings → Privacy & Security → Full Disk Access → + → ⌘⇧G
+       → /bin/bash → enable it. Broad: every shell script you run gets it.
+
+    2. Move the project somewhere unprotected — ~/Projects rather than
+       ~/Documents/Projects. Narrower, and needs no privilege grant at all.
+
+    Then re-run this command. It re-checks.
+
+EOF
+}
+
+# Publishing needs the Claude Code CLI. Prefer a real install; fall back to the
+# binary inside the VS Code / Cursor extension, newest version first — that path
+# is version-stamped and moves on every editor update, so it is resolved fresh
+# each run rather than baked into the launchd job.
+find_claude() {
+  [[ -n "${PLAN_CLAUDE:-}" ]] && { echo "$PLAN_CLAUDE"; return; }
+  local c
+  c="$(command -v claude 2>/dev/null || true)"
+  [[ -n "$c" ]] && { echo "$c"; return; }
+  [[ -x "$HOME/.claude/local/claude" ]] && { echo "$HOME/.claude/local/claude"; return; }
+  for base in "$HOME/.vscode/extensions" "$HOME/.vscode-server/extensions" \
+              "$HOME/.cursor/extensions"; do
+    c="$(ls -d "$base"/anthropic.claude-code-*/resources/native-binary/claude \
+         2>/dev/null | sort -V | tail -1)"
+    [[ -n "$c" && -x "$c" ]] && { echo "$c"; return; }
+  done
+  return 1
 }
 
 cmd_init() {
@@ -90,13 +191,12 @@ c=planconfig.load(); print(os.path.relpath(c.plan_dir, c.root))")"
   node "$ENGINE/test/render_check.js" "$plandir/gantt.html"
 }
 
-cmd_daily() {
-  local root; root="$(find_root)"; cd "$root"
-  local today dow
-  today="$(date +%F)"; dow="$(date +%u)"
-  [[ "$dow" -ge 6 ]] && { note "$today is a weekend — the plan only moves on working days."; exit 0; }
+# Pull, regenerate, and commit+push the generated files if they actually moved.
+# Shared by `plan daily` and `plan watch` so the two can never drift apart.
+# $1 = subject line for the commit.
+refresh_and_commit() {
+  local subject="$1" today; today="$(date +%F)"
 
-  echo "── plan refresh · $today ──────────────────────────────────────────"
   if git rev-parse --git-dir >/dev/null 2>&1; then
     git fetch --all --prune --quiet || true
     if [[ -z "$(git status --porcelain)" ]] && git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
@@ -108,26 +208,34 @@ cmd_daily() {
 
   cmd_refresh
 
-  if git rev-parse --git-dir >/dev/null 2>&1; then
-    local plandir; plandir="$("$PY" -c "
-import sys,os; sys.path.insert(0,'$ENGINE'); import planconfig
-c=planconfig.load(); print(os.path.relpath(c.plan_dir, c.root))")"
-    # Commit ONLY the generated plan files, by path. A scheduled job must never
-    # sweep up whatever somebody left staged and label it a plan refresh —
-    # `git add` + bare `git commit` does exactly that, and it happened once.
-    local files=("$plandir/GANTT.md" "$plandir/gantt.html" "$plandir/tasks.csv"
-                 "$plandir/standup/$today.md")
-    local present=(); for f in "${files[@]}"; do [[ -f "$f" ]] && present+=("$f"); done
-    if [[ ${#present[@]} -gt 0 ]] && ! git diff --quiet -- "${present[@]}" 2>/dev/null \
-       || git ls-files --others --exclude-standard -- "${present[@]}" | grep -q .; then
-      git commit -q -m "chore(plan): daily schedule refresh $today" \
-                    -m "Regenerated by plan-tracker. Status derived from git." \
-                    -- "${present[@]}"
-      git push --quiet origin HEAD 2>/dev/null && note "  pushed" || note "  (push failed — plan is committed locally)"
-    else
-      note "  plan unchanged — nothing to commit"
-    fi
+  git rev-parse --git-dir >/dev/null 2>&1 || return 0
+  load_config
+  # Commit ONLY the generated plan files, by path. A scheduled job must never
+  # sweep up whatever somebody left staged and label it a plan refresh —
+  # `git add` + bare `git commit` does exactly that, and it happened once.
+  local files=("$PLAN_DIR/GANTT.md" "$PLAN_DIR/gantt.html" "$PLAN_DIR/tasks.csv"
+               "$PLAN_DIR/standup/$today.md")
+  local present=(); for f in "${files[@]}"; do [[ -f "$f" ]] && present+=("$f"); done
+  if [[ ${#present[@]} -gt 0 ]] && ! git diff --quiet -- "${present[@]}" 2>/dev/null \
+     || git ls-files --others --exclude-standard -- "${present[@]}" | grep -q .; then
+    git commit -q -m "$subject" \
+                  -m "Regenerated by plan-tracker. Status derived from git." \
+                  -- "${present[@]}"
+    git push --quiet origin HEAD 2>/dev/null && note "  pushed" || note "  (push failed — plan is committed locally)"
+  else
+    note "  plan unchanged — nothing to commit"
   fi
+}
+
+cmd_daily() {
+  local root; root="$(find_root)"; cd "$root"
+  local today dow
+  today="$(date +%F)"; dow="$(date +%u)"
+  [[ "$dow" -ge 6 ]] && { note "$today is a weekend — the plan only moves on working days."; exit 0; }
+
+  echo "── plan refresh · $today ──────────────────────────────────────────"
+  refresh_and_commit "chore(plan): daily schedule refresh $today"
+  cmd_publish || note "  (artifact not republished)"
 
   if [[ "${PLAN_NOTIFY:-1}" == "1" ]]; then
     cmd_brief --date "$today" || note "  (briefs not posted)"
@@ -135,6 +243,178 @@ c=planconfig.load(); print(os.path.relpath(c.plan_dir, c.root))")"
     note "  notifications suppressed (PLAN_NOTIFY=0)"
   fi
   echo "── done ───────────────────────────────────────────────────────────"
+}
+
+# ── publishing ─────────────────────────────────────────────────────────────
+#
+# A published Artifact cannot pull. Its CSP blocks every external host and the
+# runtime grants no network capability, so the page can never fetch this repo —
+# especially not a private one, where a token embedded in a shareable page would
+# be a credential leak. The only direction that works is push.
+#
+# Publishing means calling the Artifact tool, which lives inside Claude Code, so
+# this shells out to one short headless run. `force` is correct here and not a
+# shortcut: gantt.html is regenerated wholesale on every refresh, so there is
+# never anything in the live version worth merging — and without it every run
+# would 409, because a fresh session holds no baseline for the artifact.
+cmd_publish() {
+  cd "$(find_root)"; load_config
+  local force=0; [[ "${1:-}" == "--force" ]] && force=1
+
+  [[ -n "$PLAN_ARTIFACT_URL" ]] || {
+    note "  no artifact configured — add an \"artifact\" block to plan.config.json"; return 0; }
+  local html="$PLAN_DIR/gantt.html"
+  [[ -f "$html" ]] || die "$html does not exist. Run 'plan refresh' first."
+
+  # Publishing costs a model call. Skip it when the bytes are identical to what
+  # was last published — a refresh that changes nothing should cost nothing.
+  local stamp; stamp="$(state_dir)/$(label_for).published"
+  local now prev; now="$(shasum -a 256 "$html" | cut -d' ' -f1)"
+  prev="$(cat "$stamp" 2>/dev/null || true)"
+  if [[ "$force" -eq 0 && "$now" == "$prev" ]]; then
+    note "  artifact already current — not republishing"; return 0
+  fi
+
+  local cli; cli="$(find_claude)" || die "Cannot find the 'claude' CLI.
+Install it, or set PLAN_CLAUDE to its path:
+  https://claude.ai/install.sh"
+
+  local prompt="Call the Artifact tool exactly once: file_path $html, \
+url $PLAN_ARTIFACT_URL, favicon $PLAN_ARTIFACT_FAVICON, force true, \
+description '$PLAN_ARTIFACT_DESC'. This file is machine-generated by \
+plan-tracker and regenerated wholesale on every run, so force is correct and \
+there is nothing in the live version to preserve. Reply with only the URL."
+
+  local out
+  if ! out="$("$cli" -p "$prompt" --allowed-tools "Artifact" "Read" \
+                     --model "$PLAN_ARTIFACT_MODEL" --max-turns 6 \
+                     --output-format json 2>&1)"; then
+    note "  publish failed — the claude CLI exited non-zero"; return 1
+  fi
+  # Success is the artifact URL coming back, not a zero exit code: the CLI exits
+  # 0 on a run that reasoned its way to doing nothing at all.
+  if grep -Fq "$PLAN_ARTIFACT_URL" <<<"$out"; then
+    printf '%s' "$now" > "$stamp"
+    note "  artifact republished → $PLAN_ARTIFACT_URL"
+  else
+    note "  publish did not confirm — artifact may be stale. Response:"
+    "$PY" -c "
+import json,sys
+try:    print('   ', json.loads(sys.stdin.read()).get('result','')[:400])
+except Exception: print('   ', sys.stdin.read()[:400])" <<<"$out" >&2
+    return 1
+  fi
+}
+
+# ── the watcher ────────────────────────────────────────────────────────────
+#
+# One poll: if any branch on the remote has moved since the last poll, pull,
+# reschedule and republish. Meant to be run every 60s by launchd rather than to
+# loop itself — no long-lived process to leak, and sleep/wake needs no handling.
+cmd_watch() {
+  case "${1:-once}" in
+    install|remove|status) cmd_watch_job "$@"; return ;;
+    once) ;;
+    *) die "plan watch [once|install|remove|status]" ;;
+  esac
+
+  cd "$(find_root)"; load_config
+  git rev-parse --git-dir >/dev/null 2>&1 || die "Not a git repository."
+
+  # An atomic lock, because two overlapping refreshes would race to commit and
+  # push the same files. mkdir is the portable atomic test-and-set.
+  local lock; lock="$(state_dir)/$(label_for).lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    if [[ -n "$(find "$lock" -maxdepth 0 -mmin +15 2>/dev/null)" ]]; then
+      note "clearing a stale lock (>15 min)"; rmdir "$lock" 2>/dev/null || true
+      mkdir "$lock" 2>/dev/null || { note "still locked — skipping"; return 0; }
+    else
+      return 0   # another poll is mid-flight; say nothing
+    fi
+  fi
+  # Expanded now, not at exit: $lock is function-local, and the trap fires after
+  # it has gone out of scope — under `set -u` that aborts instead of unlocking.
+  trap "rmdir '$lock' 2>/dev/null || true" EXIT
+
+  local refs; refs="$(state_dir)/$(label_for).refs"
+  local now prev
+  now="$(git ls-remote --heads origin 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
+  [[ -n "$now" ]] || { note "cannot reach the remote — skipping"; return 0; }
+  prev="$(cat "$refs" 2>/dev/null || true)"
+  [[ "$now" == "$prev" ]] && return 0
+
+  echo "── push detected · $(date '+%F %H:%M:%S') ─────────────────────────"
+  refresh_and_commit "chore(plan): schedule refresh after push"
+  cmd_publish || true
+
+  # Record the refs AFTER our own push, so the commit this job just made is
+  # already accounted for. Recording them before would see our own push next
+  # cycle and refresh again, forever.
+  git ls-remote --heads origin 2>/dev/null | shasum -a 256 | cut -d' ' -f1 > "$refs"
+  # Written even when publishing failed. A retry loop against a persistent
+  # failure would bill a model call every 60 seconds; the 09:00 job and the next
+  # real push both retry, which is soon enough.
+  echo "── done ───────────────────────────────────────────────────────────"
+}
+
+cmd_watch_job() {
+  local root; root="$(find_root)"
+  local label; label="$(label_for).watch"
+  local plist="$HOME/Library/LaunchAgents/$label.plist"
+  local log="$HOME/Library/Logs/plan-watch-$(basename "$root").log"
+  local interval="${2:-60}"
+
+  case "$1" in
+  install)
+    [[ "$(uname)" == "Darwin" ]] || die "'plan watch install' is macOS-only. On Linux use:
+  * * * * *  cd $root && $HERE/plan watch once >> $log 2>&1"
+    find_claude >/dev/null || die "Cannot find the 'claude' CLI — publishing would fail.
+Install it first, or set PLAN_CLAUDE."
+    load_config
+    [[ -n "$PLAN_ARTIFACT_URL" ]] || note \
+      "warning: no artifact configured — the watcher will refresh but not publish."
+    { echo '<?xml version="1.0" encoding="UTF-8"?>'
+      echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
+      echo '<plist version="1.0"><dict>'
+      echo "  <key>Label</key><string>$label</string>"
+      echo '  <key>ProgramArguments</key>'
+      echo "  <array><string>/bin/bash</string><string>-lc</string><string>$HERE/plan watch once</string></array>"
+      echo "  <key>WorkingDirectory</key><string>$root</string>"
+      echo "  <key>StartInterval</key><integer>$interval</integer>"
+      echo '  <key>EnvironmentVariables</key><dict>'
+      echo '    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>'
+      echo '    <key>PLAN_NOTIFY</key><string>0</string></dict>'
+      echo "  <key>StandardOutPath</key><string>$log</string>"
+      echo "  <key>StandardErrorPath</key><string>$log</string>"
+      echo '  <key>RunAtLoad</key><false/><key>ProcessType</key><string>Background</string>'
+      echo '</dict></plist>'
+    } > "$plist"
+    plutil -lint "$plist" >/dev/null || die "generated plist is invalid: $plist"
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$plist"
+    # Seed the ref state so installing does not immediately fire a refresh for
+    # pushes that happened before anyone asked to be watching.
+    (cd "$root" && git ls-remote --heads origin 2>/dev/null | shasum -a 256 \
+      | cut -d' ' -f1 > "$(state_dir)/$(label_for).refs") || true
+    echo "Watching $(basename "$root") every ${interval}s for pushes to any branch."
+    echo "  log     $log"
+    echo "  remove  plan watch remove"
+    preflight_launchd "$root" || { tcc_advice "$root"; exit 1; }
+    echo "  checked — a background job can reach this project"
+    ;;
+  remove)
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    rm -f "$plist"; echo "Stopped watching $(basename "$root")." ;;
+  status)
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+      echo "Watching — $label"
+      launchctl print "gui/$(id -u)/$label" | grep -E '^\s+(state|runs|last exit code)' || true
+      if [[ -f "$log" ]]; then echo; echo "Recent:"; tail -n 15 "$log"; fi
+      grep -q "Operation not permitted" "$log" 2>/dev/null && tcc_advice "$root"
+    else
+      echo "Not watching. Run: plan watch install"
+    fi ;;
+  esac
 }
 
 cmd_cron() {
@@ -174,6 +454,8 @@ cmd_cron() {
     echo "Scheduled: $(basename "$root") at $(printf '%02d:%02d' "$hour" "$minute"), Monday to Friday."
     echo "  log     $log"
     echo "  remove  plan cron remove"
+    preflight_launchd "$root" || { tcc_advice "$root"; exit 1; }
+    echo "  checked — a background job can reach this project"
     ;;
   remove)
     launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
@@ -182,7 +464,11 @@ cmd_cron() {
     if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
       echo "Scheduled — $label"
       launchctl print "gui/$(id -u)/$label" | grep -E '^\s+(state|runs|last exit code)' || true
-      [[ -f "$log" ]] && { echo; echo "Last run:"; tail -n 12 "$log"; }
+      # `&&` as the last statement would make this function exit 1 before the
+      # first run ever writes a log — a status command must not report failure
+      # for having nothing to report yet.
+      if [[ -f "$log" ]]; then echo; echo "Last run:"; tail -n 12 "$log"; fi
+      grep -q "Operation not permitted" "$log" 2>/dev/null && tcc_advice "$root"
     else
       echo "Not scheduled. Run: plan cron install"
     fi ;;
@@ -195,9 +481,15 @@ case "${1:-}" in
   refresh) shift; cmd_refresh "$@" ;;
   brief)   shift; cmd_brief "$@" ;;
   daily)   shift; cmd_daily "$@" ;;
+  publish) shift; cmd_publish "$@" ;;
+  watch)   shift; cmd_watch "$@" ;;
   cron)    shift; cmd_cron "$@" ;;
   check)   shift; cmd_check "$@" ;;
   config)  shift; cmd_config "$@" ;;
-  ""|-h|--help|help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+  # Print the header comment and stop at the first line of code. A fixed line
+  # range goes stale the moment a command is added, and starts printing `set -e`.
+  ""|-h|--help|help)
+    awk 'NR==1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' \
+      "${BASH_SOURCE[0]}" ;;
   *) die "Unknown command: $1   (try: plan help)" ;;
 esac
