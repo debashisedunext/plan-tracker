@@ -191,6 +191,16 @@ c=planconfig.load(); print(os.path.relpath(c.plan_dir, c.root))")"
   node "$ENGINE/test/render_check.js" "$plandir/gantt.html"
 }
 
+# The one branch a scheduled run is allowed to write to. `develop` when the
+# repo has one, otherwise whatever origin calls its default. PLAN_BRANCH
+# overrides for a repo that names its integration branch something else.
+integration_branch() {
+  if [[ -n "${PLAN_BRANCH:-}" ]]; then printf '%s\n' "$PLAN_BRANCH"; return; fi
+  if git show-ref --verify --quiet refs/heads/develop; then printf 'develop\n'; return; fi
+  local head; head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  printf '%s\n' "${head#origin/}"
+}
+
 # Pull, regenerate, and commit+push the generated files if they actually moved.
 # Shared by `plan daily` and `plan watch` so the two can never drift apart.
 # $1 = subject line for the commit.
@@ -198,6 +208,26 @@ refresh_and_commit() {
   local subject="$1" today; today="$(date +%F)"
 
   if git rev-parse --git-dir >/dev/null 2>&1; then
+    # A scheduled job must never touch a feature branch. The watcher fires on a
+    # push to ANY branch but regenerates against whatever is checked out here,
+    # so without this it commits the schedule onto whatever the developer is
+    # working on — and then the dirty tree blocks their next rebase.
+    #
+    # Skipping loses nothing. Status is derived from git history, not from these
+    # files, so the next run on the integration branch reproduces exactly the
+    # same result. The refresh is deferred, never dropped.
+    local current target
+    current="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    target="$(integration_branch)"
+    if [[ -z "$target" ]]; then
+      note "  cannot tell which branch is the integration branch — set PLAN_BRANCH. Skipping."
+      return 0
+    fi
+    if [[ "$current" != "$target" ]]; then
+      note "  on '$current', not '$target' — skipping so the schedule stays off feature branches."
+      return 0
+    fi
+
     git fetch --all --prune --quiet || true
     if [[ -z "$(git status --porcelain)" ]] && git rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
       git merge --ff-only '@{u}' --quiet 2>/dev/null || note "  (not fast-forwardable — using local state)"
